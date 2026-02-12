@@ -1,0 +1,135 @@
+name: 'Merge Queue'
+description: 'Lightweight merge queue for GitHub Actions. No Enterprise required.'
+author: 'Sam Bolgert'
+
+inputs:
+  github-token:
+    description: 'GitHub token (use a GitHub App token to trigger CI on branch updates)'
+    required: true
+  base-branch:
+    description: 'Base branch to merge into'
+    required: false
+    default: 'master'
+  label:
+    description: 'Label that marks PRs for the queue'
+    required: false
+    default: 'queue'
+  merge-method:
+    description: 'Merge method: squash, merge, or rebase'
+    required: false
+    default: 'squash'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Process merge queue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        QUEUE_LABEL: ${{ inputs.label }}
+        MERGE_METHOD: ${{ inputs.merge-method }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Finding queued PRs"
+
+        QUEUED_PRS=$(gh pr list \
+          --repo "$REPO" \
+          --label "$QUEUE_LABEL" \
+          --state open \
+          --base "$BASE_BRANCH" \
+          --json number,title,createdAt \
+          --jq 'sort_by(.createdAt) | .[].number')
+
+        if [ -z "$QUEUED_PRS" ]; then
+          echo "No PRs in queue. Done."
+          exit 0
+        fi
+
+        echo "Queued PRs (FIFO order): $QUEUED_PRS"
+        echo "::endgroup::"
+
+        PR_NUM=$(echo "$QUEUED_PRS" | head -1)
+        echo "::group::Processing PR #$PR_NUM"
+
+        # Must be approved
+        APPROVED=$(gh pr view "$PR_NUM" --repo "$REPO" --json reviewDecision --jq '.reviewDecision')
+        if [ "$APPROVED" != "APPROVED" ]; then
+          echo "PR #$PR_NUM is not approved (status: $APPROVED). Skipping until next cycle."
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        # No merge conflicts
+        MERGEABLE=$(gh pr view "$PR_NUM" --repo "$REPO" --json mergeable --jq '.mergeable')
+        if [ "$MERGEABLE" = "CONFLICTING" ]; then
+          echo "PR #$PR_NUM has merge conflicts. Dequeuing."
+          gh pr edit "$PR_NUM" --repo "$REPO" --remove-label "$QUEUE_LABEL"
+          gh pr comment "$PR_NUM" --repo "$REPO" \
+            --body "❌ **Merge Queue:** Removed from queue due to merge conflicts. Please resolve conflicts and re-add the \`$QUEUE_LABEL\` label."
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        # Update branch if behind
+        HEAD_REF=$(gh pr view "$PR_NUM" --repo "$REPO" --json headRefName --jq '.headRefName')
+        ENCODED_HEAD_REF=$(printf '%s' "$HEAD_REF" | jq -sRr @uri)
+        ENCODED_BASE=$(printf '%s' "$BASE_BRANCH" | jq -sRr @uri)
+        IS_BEHIND=$(gh api "/repos/$REPO/compare/$ENCODED_BASE...$ENCODED_HEAD_REF" --jq '.behind_by')
+
+        if [ "$IS_BEHIND" -gt 0 ]; then
+          echo "PR #$PR_NUM is $IS_BEHIND commits behind $BASE_BRANCH. Updating branch..."
+          if ! gh api -X PUT "/repos/$REPO/pulls/$PR_NUM/update-branch" \
+            --field expected_head_sha="$(gh pr view "$PR_NUM" --repo "$REPO" --json headRefOid --jq '.headRefOid')" \
+            2>&1; then
+            echo "::warning::Branch update API call failed for PR #$PR_NUM. Will retry next cycle."
+          else
+            echo "Branch updated. CI will re-run. Will merge on next cycle."
+          fi
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        echo "Branch is up to date."
+
+        # Check CI status
+        CI_STATE=$(gh pr checks "$PR_NUM" --repo "$REPO" --json name,state \
+          --jq '[.[] | select(.name | startswith("Merge Queue") | not)] |
+                if length == 0 then "PENDING"
+                elif any(.state == "FAILURE" or .state == "ERROR" or .state == "CANCELLED" or .state == "TIMED_OUT" or .state == "STARTUP_FAILURE" or .state == "ACTION_REQUIRED") then "FAILURE"
+                elif any(.state == "PENDING" or .state == "QUEUED" or .state == "IN_PROGRESS") then "PENDING"
+                elif all(.state == "SUCCESS" or .state == "SKIPPED" or .state == "NEUTRAL") then "SUCCESS"
+                else "UNKNOWN" end')
+
+        echo "CI state: $CI_STATE"
+
+        case "$CI_STATE" in
+          SUCCESS)
+            echo "All checks passed! Merging PR #$PR_NUM..."
+            gh pr merge "$PR_NUM" \
+              --repo "$REPO" \
+              --"$MERGE_METHOD" \
+              --delete-branch
+            echo "✅ PR #$PR_NUM merged successfully!"
+            ;;
+          PENDING)
+            echo "CI still running for PR #$PR_NUM. Will retry next cycle."
+            ;;
+          FAILURE)
+            echo "CI failed for PR #$PR_NUM. Dequeuing."
+            gh pr edit "$PR_NUM" --repo "$REPO" --remove-label "$QUEUE_LABEL"
+            gh pr comment "$PR_NUM" --repo "$REPO" \
+              --body "❌ **Merge Queue:** Removed from queue because CI checks failed. Please fix the failures and re-add the \`$QUEUE_LABEL\` label."
+            ;;
+          *)
+            echo "Unknown CI state: $CI_STATE. Will retry next cycle."
+            ;;
+        esac
+
+        echo "::endgroup::"
+
+branding:
+  icon: 'git-merge'
+  color: 'green'
