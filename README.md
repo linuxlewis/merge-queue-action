@@ -64,6 +64,7 @@ Using a GitHub App token ensures branch updates trigger CI and don't dismiss app
    - **Homepage URL:** your repo URL
    - **Webhook:** uncheck "Active"
    - **Permissions:**
+     - `Actions: Read`
      - `Contents: Read & write`
      - `Pull requests: Read & write`
      - `Checks: Read`
