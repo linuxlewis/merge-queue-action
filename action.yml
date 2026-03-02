@@ -30,7 +30,7 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
-        GH_READ_TOKEN: ${{ inputs.read-token || inputs.github-token }}
+        GH_READ_TOKEN: ${{ inputs.read-token != '' && inputs.read-token || inputs.github-token }}
         REPO: ${{ github.repository }}
         BASE_BRANCH: ${{ inputs.base-branch }}
         QUEUE_LABEL: ${{ inputs.label }}
