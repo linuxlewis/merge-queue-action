@@ -6,6 +6,10 @@ inputs:
   github-token:
     description: 'GitHub token (use a GitHub App token to trigger CI on branch updates)'
     required: true
+  read-token:
+    description: 'Token for reading check runs and commit statuses (defaults to github-token). Use GITHUB_TOKEN if your App token lacks checks:read.'
+    required: false
+    default: ''
   base-branch:
     description: 'Base branch to merge into'
     required: false
@@ -26,6 +30,7 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
+        GH_READ_TOKEN: ${{ inputs.read-token || inputs.github-token }}
         REPO: ${{ github.repository }}
         BASE_BRANCH: ${{ inputs.base-branch }}
         QUEUE_LABEL: ${{ inputs.label }}
@@ -40,7 +45,7 @@ runs:
           --label "$QUEUE_LABEL" \
           --state open \
           --base "$BASE_BRANCH" \
-          --json number,title,createdAt \
+          --json number,title,labels,createdAt \
           --jq 'sort_by(.createdAt) | .[].number')
 
         if [ -z "$QUEUED_PRS" ]; then
@@ -92,16 +97,56 @@ runs:
           exit 0
         fi
 
-        echo "Branch is up to date."
+        echo "Branch is up to date with $BASE_BRANCH."
 
-        # Check CI status
-        CI_STATE=$(gh pr checks "$PR_NUM" --repo "$REPO" --json name,state \
-          --jq '[.[] | select(.name | startswith("Merge Queue") | not)] |
-                if length == 0 then "PENDING"
-                elif any(.state == "FAILURE" or .state == "ERROR" or .state == "CANCELLED" or .state == "TIMED_OUT" or .state == "STARTUP_FAILURE" or .state == "ACTION_REQUIRED") then "FAILURE"
-                elif any(.state == "PENDING" or .state == "QUEUED" or .state == "IN_PROGRESS") then "PENDING"
-                elif all(.state == "SUCCESS" or .state == "SKIPPED" or .state == "NEUTRAL") then "SUCCESS"
-                else "UNKNOWN" end')
+        # Check CI status using REST API to capture both check runs and commit
+        # statuses. This handles third-party apps (e.g. Devin) that post commit
+        # statuses instead of check runs.
+        HEAD_SHA=$(gh pr view "$PR_NUM" --repo "$REPO" --json headRefOid --jq '.headRefOid')
+
+        # Use read token for checks/statuses (App tokens may lack checks:read)
+        CHECK_RUNS=$(GH_TOKEN="$GH_READ_TOKEN" gh api "/repos/$REPO/commits/$HEAD_SHA/check-runs" \
+          --paginate \
+          --jq '[.check_runs[] | select(.name | startswith("Merge Queue") | not) | {name: .name, status: .status, conclusion: .conclusion}]' \
+          | jq -s 'add // []')
+
+        COMMIT_STATUSES=$(GH_TOKEN="$GH_READ_TOKEN" gh api "/repos/$REPO/commits/$HEAD_SHA/status" \
+          --jq '[.statuses[] | {context: .context, state: .state}]')
+
+        echo "Check runs: $(echo "$CHECK_RUNS" | jq length)"
+        echo "Commit statuses: $(echo "$COMMIT_STATUSES" | jq length)"
+
+        CI_STATE=$(jq -rn \
+          --argjson runs "$CHECK_RUNS" \
+          --argjson statuses "$COMMIT_STATUSES" \
+          '
+          # Normalize check runs to a common shape
+          ($runs | map(
+            if .status != "completed" then {name: .name, state: "PENDING"}
+            elif .conclusion == "failure" then {name: .name, state: "FAILURE"}
+            elif .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required" then {name: .name, state: "FAILURE"}
+            elif .conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral" then {name: .name, state: "SUCCESS"}
+            else {name: .name, state: "UNKNOWN"}
+            end
+          )) as $norm_runs |
+
+          # Normalize commit statuses to a common shape
+          ($statuses | map(
+            if .state == "success" then {name: .context, state: "SUCCESS"}
+            elif .state == "failure" or .state == "error" then {name: .context, state: "FAILURE"}
+            elif .state == "pending" then {name: .context, state: "PENDING"}
+            else {name: .context, state: "UNKNOWN"}
+            end
+          )) as $norm_statuses |
+
+          ($norm_runs + $norm_statuses) |
+          if length == 0 then "PENDING"
+          elif any(.state == "FAILURE") then "FAILURE"
+          elif any(.state == "PENDING") then "PENDING"
+          elif all(.state == "SUCCESS") then "SUCCESS"
+          else "UNKNOWN"
+          end
+        ')
 
         echo "CI state: $CI_STATE"
 

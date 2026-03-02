@@ -84,6 +84,7 @@ Create a `queue` label on your repository (green `#2EA44F` recommended).
 | Input | Default | Description |
 |-------|---------|-------------|
 | `github-token` | *required* | GitHub token (use a GitHub App token) |
+| `read-token` | `github-token` | Token for reading check runs and commit statuses. Use `${{ secrets.GITHUB_TOKEN }}` if your App token lacks `checks:read`. |
 | `base-branch` | `master` | Base branch to merge into |
 | `label` | `queue` | Label that marks PRs for the queue |
 | `merge-method` | `squash` | Merge method: `squash`, `merge`, or `rebase` |
@@ -95,6 +96,7 @@ Create a `queue` label on your repository (green `#2EA44F` recommended).
         uses: linuxlewis/merge-queue-action@v1
         with:
           github-token: ${{ steps.app-token.outputs.token }}
+          read-token: ${{ secrets.GITHUB_TOKEN }}
           base-branch: main
           label: ready-to-merge
           merge-method: rebase
