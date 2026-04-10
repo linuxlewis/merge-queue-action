@@ -52,6 +52,10 @@ jobs:
 
 That's it. Create a `queue` label on your repo, and start labeling approved PRs.
 
+The action now bootstraps `gh` and `jq` automatically on Linux runners when they are missing, so it works on GitHub-hosted Ubuntu and self-hosted Linux systems such as Amazon Linux without requiring distro-specific install steps.
+
+By default it installs pinned versions of those tools, and you can override the versions through action inputs if you want to move faster than the defaults.
+
 ## Setup
 
 ### 1. Create a GitHub App
@@ -88,6 +92,8 @@ Create a `queue` label on your repository (green `#2EA44F` recommended).
 | `base-branch` | `master` | Base branch to merge into |
 | `label` | `queue` | Label that marks PRs for the queue |
 | `merge-method` | `squash` | Merge method: `squash`, `merge`, or `rebase` |
+| `gh-version` | `2.89.0` | `gh` version to install on Linux runners when missing |
+| `jq-version` | `1.8.1` | `jq` version to install on Linux runners when missing |
 
 ### Example with custom options
 
@@ -100,6 +106,17 @@ Create a `queue` label on your repository (green `#2EA44F` recommended).
           base-branch: main
           label: ready-to-merge
           merge-method: rebase
+```
+
+### Example with tool version overrides
+
+```yaml
+      - name: Run merge queue
+        uses: linuxlewis/merge-queue-action@v1
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          gh-version: 2.89.0
+          jq-version: 1.8.1
 ```
 
 ## How It Works
@@ -132,6 +149,10 @@ Developer adds "queue" label
 ```
 
 PRs are processed one at a time, oldest first (FIFO). This avoids the exact problem of multiple PRs racing to merge and invalidating each other.
+
+## Runner Compatibility
+
+The action is designed for Linux runners. If `gh` or `jq` are not already on `PATH`, it downloads official release binaries into the runner temp directory and adds them to `PATH` for subsequent steps. This avoids package-manager assumptions and works across common Linux distributions, including Amazon Linux. The default installed versions are pinned in the action inputs, and you can override them per workflow.
 
 ## Why Not GitHub's Native Merge Queue?
 
