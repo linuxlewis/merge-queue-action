@@ -50,7 +50,7 @@ jobs:
           github-token: ${{ steps.app-token.outputs.token }}
 ```
 
-That's it. Create a `queue` label on your repo, and start labeling approved PRs.
+That's it. Create a `queue` label on your repo, and start labeling PRs that should enter the queue.
 
 The action now bootstraps `gh` and `jq` automatically on Linux runners when they are missing, so it works on GitHub-hosted Ubuntu and self-hosted Linux systems such as Amazon Linux without requiring distro-specific install steps.
 
@@ -78,6 +78,8 @@ Using a GitHub App token ensures branch updates trigger CI and don't dismiss app
 6. Add repo secrets:
    - `MERGE_QUEUE_APP_ID` — the numeric App ID
    - `MERGE_QUEUE_APP_PRIVATE_KEY` — full contents of the `.pem` file
+
+The action reads active branch rules to decide whether approval is required. If you still rely on legacy branch protection instead of rulesets and want the action to pre-detect review requirements, grant the app `Administration: Read`; otherwise GitHub still enforces those protections when the merge is attempted.
 
 ### 2. Create the label
 
@@ -126,7 +128,12 @@ Developer adds "queue" label
          │
          ▼
 ┌─────────────────┐
-│   PR approved?   │──No──▶ Skip, retry next cycle
+│ Reviews needed? │──No──▶ Skip approval gate
+└────────┬────────┘
+         │Yes
+         ▼
+┌─────────────────┐
+│  Reviews OK?    │──No──▶ Skip, retry next cycle
 └────────┬────────┘
          │Yes
          ▼
@@ -149,6 +156,8 @@ Developer adds "queue" label
 ```
 
 PRs are processed one at a time, oldest first (FIFO). This avoids the exact problem of multiple PRs racing to merge and invalidating each other.
+
+Review approval is not hard-coded. The action inspects active GitHub branch rules for the target branch and only requires `reviewDecision: APPROVED` when those rules require approval, code owner review, last-push approval, or required reviewers. Rulesets with `required_approving_review_count: 0` are treated as approval-optional.
 
 ## Runner Compatibility
 

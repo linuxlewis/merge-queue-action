@@ -145,12 +145,72 @@ runs:
         PR_NUM=$(echo "$QUEUED_PRS" | head -1)
         echo "::group::Processing PR #$PR_NUM"
 
-        # Must be approved
-        APPROVED=$(gh pr view "$PR_NUM" --repo "$REPO" --json reviewDecision --jq '.reviewDecision')
-        if [ "$APPROVED" != "APPROVED" ]; then
-          echo "PR #$PR_NUM is not approved (status: $APPROVED). Skipping until next cycle."
-          echo "::endgroup::"
-          exit 0
+        ENCODED_BASE=$(printf '%s' "$BASE_BRANCH" | jq -sRr @uri)
+
+        # Match GitHub's configured review requirements instead of requiring
+        # approval unconditionally.
+        BRANCH_RULES='[]'
+        RULES_ERROR=$(mktemp)
+        if BRANCH_RULES=$(gh api "/repos/$REPO/rules/branches/$ENCODED_BASE" --paginate 2>"$RULES_ERROR" | jq -s 'add // []'); then
+          PULL_REQUEST_RULE_COUNT=$(echo "$BRANCH_RULES" | jq '[.[] | select(.type == "pull_request")] | length')
+        else
+          RULES_MESSAGE=$(tr '\n' ' ' < "$RULES_ERROR")
+          echo "::warning::Could not read active branch rules for $BASE_BRANCH. Falling back to legacy branch protection when available. $RULES_MESSAGE"
+          PULL_REQUEST_RULE_COUNT=0
+        fi
+        rm -f "$RULES_ERROR"
+
+        RULESET_REVIEW_REQUIREMENT_COUNT=$(echo "$BRANCH_RULES" | jq '
+          [
+            .[]
+            | select(.type == "pull_request")
+            | (.parameters // {})
+            | select(
+                ((.required_approving_review_count // 0) > 0) or
+                (.require_code_owner_review // false) or
+                (.require_last_push_approval // false) or
+                ((.required_reviewers // []) | map(select((.minimum_approvals // 0) > 0)) | length > 0)
+              )
+          ]
+          | length
+        ')
+        RULESET_REQUIRED_APPROVALS=$(echo "$BRANCH_RULES" | jq '[.[] | select(.type == "pull_request") | ((.parameters // {}).required_approving_review_count // 0)] | max // 0')
+
+        LEGACY_REVIEW_REQUIRED=false
+        LEGACY_REQUIRED_APPROVALS=0
+        LEGACY_ERROR=$(mktemp)
+        if LEGACY_REVIEW_PROTECTION=$(gh api "/repos/$REPO/branches/$ENCODED_BASE/protection/required_pull_request_reviews" 2>"$LEGACY_ERROR"); then
+          LEGACY_REVIEW_REQUIRED=$(echo "$LEGACY_REVIEW_PROTECTION" | jq -r '
+            ((.required_approving_review_count // 0) > 0) or
+            (.require_code_owner_reviews // false) or
+            (.require_last_push_approval // false)
+          ')
+          LEGACY_REQUIRED_APPROVALS=$(echo "$LEGACY_REVIEW_PROTECTION" | jq -r '.required_approving_review_count // 0')
+        else
+          LEGACY_MESSAGE=$(tr '\n' ' ' < "$LEGACY_ERROR")
+          if ! echo "$LEGACY_MESSAGE" | grep -qiE 'branch not protected|not found'; then
+            echo "::notice::Could not read legacy pull request review protection for $BASE_BRANCH. GitHub will still enforce it during merge. $LEGACY_MESSAGE"
+          fi
+        fi
+        rm -f "$LEGACY_ERROR"
+
+        REVIEW_REQUIRED=false
+        if [ "$RULESET_REVIEW_REQUIREMENT_COUNT" -gt 0 ] || [ "$LEGACY_REVIEW_REQUIRED" = "true" ]; then
+          REVIEW_REQUIRED=true
+        fi
+
+        if [ "$REVIEW_REQUIRED" = "true" ]; then
+          echo "Branch rules require review approval. Ruleset required approvals: $RULESET_REQUIRED_APPROVALS. Legacy required approvals: $LEGACY_REQUIRED_APPROVALS."
+          APPROVED=$(gh pr view "$PR_NUM" --repo "$REPO" --json reviewDecision --jq '.reviewDecision')
+          if [ "$APPROVED" != "APPROVED" ]; then
+            echo "PR #$PR_NUM does not satisfy review requirements (status: $APPROVED). Skipping until next cycle."
+            echo "::endgroup::"
+            exit 0
+          fi
+        elif [ "$PULL_REQUEST_RULE_COUNT" -gt 0 ]; then
+          echo "Active branch pull request rules do not require approval. Skipping approval gate."
+        else
+          echo "No branch approval requirement detected. Skipping approval gate."
         fi
 
         # No merge conflicts
@@ -167,7 +227,6 @@ runs:
         # Update branch if behind
         HEAD_REF=$(gh pr view "$PR_NUM" --repo "$REPO" --json headRefName --jq '.headRefName')
         ENCODED_HEAD_REF=$(printf '%s' "$HEAD_REF" | jq -sRr @uri)
-        ENCODED_BASE=$(printf '%s' "$BASE_BRANCH" | jq -sRr @uri)
         IS_BEHIND=$(gh api "/repos/$REPO/compare/$ENCODED_BASE...$ENCODED_HEAD_REF" --jq '.behind_by')
 
         if [ "$IS_BEHIND" -gt 0 ]; then
@@ -239,11 +298,14 @@ runs:
         case "$CI_STATE" in
           SUCCESS)
             echo "All checks passed! Merging PR #$PR_NUM..."
-            gh pr merge "$PR_NUM" \
+            if gh pr merge "$PR_NUM" \
               --repo "$REPO" \
               --"$MERGE_METHOD" \
-              --delete-branch
-            echo "✅ PR #$PR_NUM merged successfully!"
+              --delete-branch; then
+              echo "✅ PR #$PR_NUM merged successfully!"
+            else
+              echo "::warning::GitHub rejected the merge for PR #$PR_NUM. It will stay queued and retry next cycle."
+            fi
             ;;
           PENDING)
             echo "CI still running for PR #$PR_NUM. Will retry next cycle."
