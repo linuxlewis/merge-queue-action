@@ -163,6 +163,8 @@ Review approval is not hard-coded. The action inspects active GitHub branch rule
 
 Failed GitHub Actions jobs are retried before a PR is dequeued. The retry budget is tracked by GitHub's workflow run state: each workflow run has a `run_attempt`, and the action only reruns failed jobs while that attempt count is within `max-ci-reruns`. Because workflow runs are looked up for the current PR head SHA, pushing a new commit or updating the branch to the latest base creates new CI runs and naturally resets the retry budget. Failed third-party commit statuses cannot be rerun by this action, so they still cause the PR to be dequeued.
 
+If reruns fail with `Resource not accessible by integration`, the token passed as `github-token` does not have effective `Actions: write` permission for that repository. For GitHub Apps, confirm both the app's repository permissions and the repository installation have accepted the updated permissions. If you down-scope `actions/create-github-app-token`, include `permission-actions: write`.
+
 ## Runner Compatibility
 
 The action is designed for Linux runners. If `gh` or `jq` are not already on `PATH`, it downloads official release binaries into the runner temp directory and adds them to `PATH` for subsequent steps. This avoids package-manager assumptions and works across common Linux distributions, including Amazon Linux. The default installed versions are pinned in the action inputs, and you can override them per workflow.

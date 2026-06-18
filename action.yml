@@ -367,14 +367,32 @@ runs:
 
             if [ "$RERUNNABLE_ACTION_RUN_COUNT" -gt 0 ]; then
               echo "CI failed for PR #$PR_NUM. Re-running failed jobs for $RERUNNABLE_ACTION_RUN_COUNT GitHub Actions workflow run(s)."
-              echo "$RERUNNABLE_ACTION_RUNS" | jq -c '.[]' | while read -r run; do
+              RERUN_FAILED=false
+
+              while read -r run; do
                 RUN_ID=$(echo "$run" | jq -r '.id')
                 RUN_NAME=$(echo "$run" | jq -r '.name')
                 RUN_ATTEMPT=$(echo "$run" | jq -r '.run_attempt')
 
                 echo "Re-running failed jobs for workflow run $RUN_ID ($RUN_NAME), completed attempt $RUN_ATTEMPT. Retry budget: $MAX_CI_RERUNS."
-                gh api -X POST "/repos/$REPO/actions/runs/$RUN_ID/rerun-failed-jobs" >/dev/null
-              done
+                RERUN_ERROR=$(mktemp)
+                if ! gh api -X POST "/repos/$REPO/actions/runs/$RUN_ID/rerun-failed-jobs" >/dev/null 2>"$RERUN_ERROR"; then
+                  RERUN_MESSAGE=$(tr '\n' ' ' < "$RERUN_ERROR")
+                  echo "::warning::Could not rerun failed jobs for workflow run $RUN_ID ($RUN_NAME). $RERUN_MESSAGE"
+                  RERUN_FAILED=true
+                fi
+                rm -f "$RERUN_ERROR"
+              done < <(echo "$RERUNNABLE_ACTION_RUNS" | jq -c '.[]')
+
+              if [ "$RERUN_FAILED" = "true" ]; then
+                DEQUEUE_REASON="CI failed, and the action could not request a GitHub Actions rerun. Check that the token passed as github-token has Actions: write permission on this repository."
+                echo "$DEQUEUE_REASON Dequeuing PR #$PR_NUM."
+                gh pr edit "$PR_NUM" --repo "$REPO" --remove-label "$QUEUE_LABEL"
+                gh pr comment "$PR_NUM" --repo "$REPO" \
+                  --body "❌ **Merge Queue:** Removed from queue because $DEQUEUE_REASON Please fix the token permissions or re-add the \`$QUEUE_LABEL\` label after CI is fixed."
+                echo "::endgroup::"
+                exit 0
+              fi
 
               echo "Failed jobs were re-run. PR #$PR_NUM will stay queued and be checked again next cycle."
               echo "::endgroup::"
