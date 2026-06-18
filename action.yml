@@ -22,6 +22,10 @@ inputs:
     description: 'Merge method: squash, merge, or rebase'
     required: false
     default: 'squash'
+  max-ci-reruns:
+    description: 'Maximum number of failed GitHub Actions job reruns per PR head commit before dequeuing. Set to 0 to disable reruns.'
+    required: false
+    default: '3'
   gh-version:
     description: 'GitHub CLI version to install on Linux runners when gh is missing'
     required: false
@@ -121,8 +125,14 @@ runs:
         BASE_BRANCH: ${{ inputs.base-branch }}
         QUEUE_LABEL: ${{ inputs.label }}
         MERGE_METHOD: ${{ inputs.merge-method }}
+        MAX_CI_RERUNS: ${{ inputs.max-ci-reruns }}
       run: |
         set -euo pipefail
+
+        if ! [[ "$MAX_CI_RERUNS" =~ ^[0-9]+$ ]]; then
+          echo "::error::max-ci-reruns must be a non-negative integer. Got: $MAX_CI_RERUNS"
+          exit 1
+        fi
 
         echo "::group::Finding queued PRs"
 
@@ -252,7 +262,7 @@ runs:
         # Use read token for checks/statuses (App tokens may lack checks:read)
         CHECK_RUNS=$(GH_TOKEN="$GH_READ_TOKEN" gh api "/repos/$REPO/commits/$HEAD_SHA/check-runs" \
           --paginate \
-          --jq '[.check_runs[] | select(.name | startswith("Merge Queue") | not) | {name: .name, status: .status, conclusion: .conclusion}]' \
+          --jq '[.check_runs[] | select(.name | startswith("Merge Queue") | not) | {name: .name, status: .status, conclusion: .conclusion, app_name: (.app.name // ""), app_slug: (.app.slug // ""), check_suite_id: (.check_suite.id // null)}]' \
           | jq -s 'add // []')
 
         COMMIT_STATUSES=$(GH_TOKEN="$GH_READ_TOKEN" gh api "/repos/$REPO/commits/$HEAD_SHA/status" \
@@ -311,10 +321,78 @@ runs:
             echo "CI still running for PR #$PR_NUM. Will retry next cycle."
             ;;
           FAILURE)
-            echo "CI failed for PR #$PR_NUM. Dequeuing."
+            FAILED_ACTION_SUITE_IDS=$(echo "$CHECK_RUNS" | jq '
+              [
+                .[]
+                | select(.status == "completed")
+                | select(
+                    .conclusion == "failure" or
+                    .conclusion == "cancelled" or
+                    .conclusion == "timed_out" or
+                    .conclusion == "action_required"
+                  )
+                | select(.app_slug == "github-actions" or .app_name == "GitHub Actions")
+                | .check_suite_id
+                | select(. != null)
+              ]
+              | unique
+            ')
+
+            FAILED_ACTION_SUITE_COUNT=$(echo "$FAILED_ACTION_SUITE_IDS" | jq length)
+            FAILED_ACTION_RUNS='[]'
+
+            if [ "$FAILED_ACTION_SUITE_COUNT" -gt 0 ]; then
+              # Workflow run_attempt is scoped to the workflow run/check suite for
+              # this head SHA, so retry budgets reset on new commits or branch updates.
+              FAILED_ACTION_RUNS=$(GH_TOKEN="$GH_READ_TOKEN" gh api "/repos/$REPO/actions/runs?head_sha=$HEAD_SHA&per_page=100" \
+                --paginate \
+                --jq '.workflow_runs[] | {id: .id, name: .name, conclusion: .conclusion, run_attempt: (.run_attempt // 1), check_suite_id: .check_suite_id, html_url: .html_url}' \
+                | jq -s --argjson suite_ids "$FAILED_ACTION_SUITE_IDS" '
+                    [
+                      .[]
+                      | select(.check_suite_id as $suite_id | $suite_ids | index($suite_id))
+                      | select(
+                          .conclusion == "failure" or
+                          .conclusion == "cancelled" or
+                          .conclusion == "timed_out" or
+                          .conclusion == "action_required"
+                        )
+                    ]
+                  ')
+            fi
+
+            FAILED_ACTION_RUN_COUNT=$(echo "$FAILED_ACTION_RUNS" | jq length)
+            RERUNNABLE_ACTION_RUNS=$(echo "$FAILED_ACTION_RUNS" | jq --argjson max "$MAX_CI_RERUNS" '[.[] | select((.run_attempt // 1) <= $max)]')
+            RERUNNABLE_ACTION_RUN_COUNT=$(echo "$RERUNNABLE_ACTION_RUNS" | jq length)
+
+            if [ "$RERUNNABLE_ACTION_RUN_COUNT" -gt 0 ]; then
+              echo "CI failed for PR #$PR_NUM. Re-running failed jobs for $RERUNNABLE_ACTION_RUN_COUNT GitHub Actions workflow run(s)."
+              echo "$RERUNNABLE_ACTION_RUNS" | jq -c '.[]' | while read -r run; do
+                RUN_ID=$(echo "$run" | jq -r '.id')
+                RUN_NAME=$(echo "$run" | jq -r '.name')
+                RUN_ATTEMPT=$(echo "$run" | jq -r '.run_attempt')
+
+                echo "Re-running failed jobs for workflow run $RUN_ID ($RUN_NAME), completed attempt $RUN_ATTEMPT. Retry budget: $MAX_CI_RERUNS."
+                gh api -X POST "/repos/$REPO/actions/runs/$RUN_ID/rerun-failed-jobs" >/dev/null
+              done
+
+              echo "Failed jobs were re-run. PR #$PR_NUM will stay queued and be checked again next cycle."
+              echo "::endgroup::"
+              exit 0
+            fi
+
+            if [ "$FAILED_ACTION_SUITE_COUNT" -eq 0 ]; then
+              DEQUEUE_REASON="CI checks failed, but no failed GitHub Actions jobs were found to rerun."
+            elif [ "$FAILED_ACTION_RUN_COUNT" -eq 0 ]; then
+              DEQUEUE_REASON="CI checks failed, but no matching failed GitHub Actions workflow runs were found for the current head commit."
+            else
+              DEQUEUE_REASON="CI failed after $MAX_CI_RERUNS allowed rerun(s) for the current head commit."
+            fi
+
+            echo "$DEQUEUE_REASON Dequeuing PR #$PR_NUM."
             gh pr edit "$PR_NUM" --repo "$REPO" --remove-label "$QUEUE_LABEL"
             gh pr comment "$PR_NUM" --repo "$REPO" \
-              --body "❌ **Merge Queue:** Removed from queue because CI checks failed. Please fix the failures and re-add the \`$QUEUE_LABEL\` label."
+              --body "❌ **Merge Queue:** Removed from queue because $DEQUEUE_REASON Please fix the failures or push an update, then re-add the \`$QUEUE_LABEL\` label."
             ;;
           *)
             echo "Unknown CI state: $CI_STATE. Will retry next cycle."

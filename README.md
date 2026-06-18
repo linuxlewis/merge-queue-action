@@ -68,7 +68,7 @@ Using a GitHub App token ensures branch updates trigger CI and don't dismiss app
    - **Homepage URL:** your repo URL
    - **Webhook:** uncheck "Active"
    - **Permissions:**
-     - `Actions: Read`
+     - `Actions: Read & write`
      - `Contents: Read & write`
      - `Pull requests: Read & write`
      - `Checks: Read`
@@ -94,6 +94,7 @@ Create a `queue` label on your repository (green `#2EA44F` recommended).
 | `base-branch` | `master` | Base branch to merge into |
 | `label` | `queue` | Label that marks PRs for the queue |
 | `merge-method` | `squash` | Merge method: `squash`, `merge`, or `rebase` |
+| `max-ci-reruns` | `3` | Maximum number of failed GitHub Actions job reruns per PR head commit before dequeuing. Set to `0` to disable reruns. |
 | `gh-version` | `2.89.0` | `gh` version to install on Linux runners when missing |
 | `jq-version` | `1.8.1` | `jq` version to install on Linux runners when missing |
 
@@ -108,6 +109,7 @@ Create a `queue` label on your repository (green `#2EA44F` recommended).
           base-branch: main
           label: ready-to-merge
           merge-method: rebase
+          max-ci-reruns: 3
 ```
 
 ### Example with tool version overrides
@@ -148,8 +150,8 @@ Developer adds "queue" label
          │No
          ▼
 ┌─────────────────┐
-│   CI passing?    │──No──▶ Dequeue + comment (failure)
-└────────┬────────┘        or retry (pending)
+│   CI passing?    │──No──▶ Rerun failed GitHub Actions jobs
+└────────┬────────┘        or dequeue after retry budget
          │Yes
          ▼
     ✅ Merge!
@@ -158,6 +160,8 @@ Developer adds "queue" label
 PRs are processed one at a time, oldest first (FIFO). This avoids the exact problem of multiple PRs racing to merge and invalidating each other.
 
 Review approval is not hard-coded. The action inspects active GitHub branch rules for the target branch and only requires `reviewDecision: APPROVED` when those rules require approval, code owner review, last-push approval, or required reviewers. Rulesets with `required_approving_review_count: 0` are treated as approval-optional.
+
+Failed GitHub Actions jobs are retried before a PR is dequeued. The retry budget is tracked by GitHub's workflow run state: each workflow run has a `run_attempt`, and the action only reruns failed jobs while that attempt count is within `max-ci-reruns`. Because workflow runs are looked up for the current PR head SHA, pushing a new commit or updating the branch to the latest base creates new CI runs and naturally resets the retry budget. Failed third-party commit statuses cannot be rerun by this action, so they still cause the PR to be dequeued.
 
 ## Runner Compatibility
 
