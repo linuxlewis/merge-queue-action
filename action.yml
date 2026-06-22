@@ -10,6 +10,10 @@ inputs:
     description: 'Token for reading check runs and commit statuses (defaults to github-token). Use GITHUB_TOKEN if your App token lacks checks:read.'
     required: false
     default: ''
+  rerun-token:
+    description: 'Token for rerunning failed GitHub Actions jobs (defaults to github-token). Use GITHUB_TOKEN with actions:write if your App token cannot rerun workflows.'
+    required: false
+    default: ''
   base-branch:
     description: 'Base branch to merge into'
     required: false
@@ -121,6 +125,7 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.github-token }}
         GH_READ_TOKEN: ${{ inputs.read-token != '' && inputs.read-token || inputs.github-token }}
+        GH_RERUN_TOKEN: ${{ inputs.rerun-token != '' && inputs.rerun-token || inputs.github-token }}
         REPO: ${{ github.repository }}
         BASE_BRANCH: ${{ inputs.base-branch }}
         QUEUE_LABEL: ${{ inputs.label }}
@@ -376,7 +381,7 @@ runs:
 
                 echo "Re-running failed jobs for workflow run $RUN_ID ($RUN_NAME), completed attempt $RUN_ATTEMPT. Retry budget: $MAX_CI_RERUNS."
                 RERUN_ERROR=$(mktemp)
-                if ! gh api -X POST "/repos/$REPO/actions/runs/$RUN_ID/rerun-failed-jobs" >/dev/null 2>"$RERUN_ERROR"; then
+                if ! GH_TOKEN="$GH_RERUN_TOKEN" gh api -X POST "/repos/$REPO/actions/runs/$RUN_ID/rerun-failed-jobs" >/dev/null 2>"$RERUN_ERROR"; then
                   RERUN_MESSAGE=$(tr '\n' ' ' < "$RERUN_ERROR")
                   echo "::warning::Could not rerun failed jobs for workflow run $RUN_ID ($RUN_NAME). $RERUN_MESSAGE"
                   RERUN_FAILED=true
@@ -385,7 +390,7 @@ runs:
               done < <(echo "$RERUNNABLE_ACTION_RUNS" | jq -c '.[]')
 
               if [ "$RERUN_FAILED" = "true" ]; then
-                DEQUEUE_REASON="CI failed, and the action could not request a GitHub Actions rerun. Check that the token passed as github-token has Actions: write permission on this repository."
+                DEQUEUE_REASON="CI failed, and the action could not request a GitHub Actions rerun. Check that the token passed as rerun-token, or github-token when rerun-token is unset, has Actions: write permission on this repository."
                 echo "$DEQUEUE_REASON Dequeuing PR #$PR_NUM."
                 gh pr edit "$PR_NUM" --repo "$REPO" --remove-label "$QUEUE_LABEL"
                 gh pr comment "$PR_NUM" --repo "$REPO" \

@@ -26,6 +26,12 @@ on:
     types: [labeled]
   workflow_dispatch: {}
 
+permissions:
+  actions: write
+  checks: read
+  contents: read
+  statuses: read
+
 concurrency:
   group: merge-queue
   cancel-in-progress: false
@@ -43,11 +49,16 @@ jobs:
         with:
           app-id: ${{ secrets.MERGE_QUEUE_APP_ID }}
           private-key: ${{ secrets.MERGE_QUEUE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-checks: read
 
       - name: Run merge queue
         uses: linuxlewis/merge-queue-action@v1
         with:
           github-token: ${{ steps.app-token.outputs.token }}
+          read-token: ${{ secrets.GITHUB_TOKEN }}
+          rerun-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
 That's it. Create a `queue` label on your repo, and start labeling PRs that should enter the queue.
@@ -68,7 +79,7 @@ Using a GitHub App token ensures branch updates trigger CI and don't dismiss app
    - **Homepage URL:** your repo URL
    - **Webhook:** uncheck "Active"
    - **Permissions:**
-     - `Actions: Read & write`
+     - `Actions: Read & write` if using the GitHub App token for reruns, or `Actions: Read` if passing `${{ secrets.GITHUB_TOKEN }}` as `rerun-token`
      - `Contents: Read & write`
      - `Pull requests: Read & write`
      - `Checks: Read`
@@ -91,6 +102,7 @@ Create a `queue` label on your repository (green `#2EA44F` recommended).
 |-------|---------|-------------|
 | `github-token` | *required* | GitHub token (use a GitHub App token) |
 | `read-token` | `github-token` | Token for reading check runs and commit statuses. Use `${{ secrets.GITHUB_TOKEN }}` if your App token lacks `checks:read`. |
+| `rerun-token` | `github-token` | Token for rerunning failed GitHub Actions jobs. Use `${{ secrets.GITHUB_TOKEN }}` with `actions: write` if your App token cannot rerun workflows. |
 | `base-branch` | `master` | Base branch to merge into |
 | `label` | `queue` | Label that marks PRs for the queue |
 | `merge-method` | `squash` | Merge method: `squash`, `merge`, or `rebase` |
@@ -106,6 +118,7 @@ Create a `queue` label on your repository (green `#2EA44F` recommended).
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           read-token: ${{ secrets.GITHUB_TOKEN }}
+          rerun-token: ${{ secrets.GITHUB_TOKEN }}
           base-branch: main
           label: ready-to-merge
           merge-method: rebase
@@ -163,7 +176,7 @@ Review approval is not hard-coded. The action inspects active GitHub branch rule
 
 Failed GitHub Actions jobs are retried before a PR is dequeued. The retry budget is tracked by GitHub's workflow run state: each workflow run has a `run_attempt`, and the action only reruns failed jobs while that attempt count is within `max-ci-reruns`. Because workflow runs are looked up for the current PR head SHA, pushing a new commit or updating the branch to the latest base creates new CI runs and naturally resets the retry budget. Failed third-party commit statuses cannot be rerun by this action, so they still cause the PR to be dequeued.
 
-If reruns fail with `Resource not accessible by integration`, the token passed as `github-token` does not have effective `Actions: write` permission for that repository. For GitHub Apps, confirm both the app's repository permissions and the repository installation have accepted the updated permissions. If you down-scope `actions/create-github-app-token`, include `permission-actions: write`.
+If reruns fail with `Resource not accessible by integration`, the token used for reruns does not have effective `Actions: write` permission for that repository. The recommended setup is to pass `${{ secrets.GITHUB_TOKEN }}` as `rerun-token` and grant `actions: write` in the workflow permissions block. If you use the GitHub App token for reruns instead, confirm both the app's repository permissions and the repository installation have accepted the updated permissions. If you down-scope `actions/create-github-app-token`, include `permission-actions: write`.
 
 ## Runner Compatibility
 
